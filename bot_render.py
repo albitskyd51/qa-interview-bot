@@ -1931,6 +1931,8 @@ user_data = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Расширенное стартовое сообщение с выбором режима и уровня"""
     try:
+        logger.info(f"Received /start command from user {update.message.from_user.id}")
+
         user_id = update.message.from_user.id
         username = update.message.from_user.username or ""
         first_name = update.message.from_user.first_name or "друг"
@@ -2445,9 +2447,12 @@ def main() -> None:
         application.add_handler(CommandHandler("reset", reset))
         application.add_handler(CallbackQueryHandler(button_callback))
 
+        logger.info("✅ Handlers registered: /start, /stats, /reset, callbacks")
+
         # Запуск бота
         logger.info("🤖 Бот запущен и готов к работе!")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("📡 Starting polling...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
     except Exception as e:
         logger.error(f"❌ Critical error in main: {e}", exc_info=True)
