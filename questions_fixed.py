@@ -1,229 +1,6 @@
-import logging
-import os
-import sqlite3
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import random
-from keep_alive import keep_alive
-from contextlib import contextmanager
+# Исправленная база вопросов для Telegram бота
+# Убраны все \n из вариантов ответов для корректного отображения
 
-# Запускаем keep-alive сервер для Render
-keep_alive()
-
-# Настройка расширенного логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ==================== DATABASE ====================
-
-DB_NAME = 'qa_bot.db'
-
-@contextmanager
-def get_db():
-    """Context manager для работы с БД"""
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Database error: {e}")
-        raise
-    else:
-        conn.commit()
-    finally:
-        conn.close()
-
-def init_database():
-    """Инициализация базы данных"""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-
-            # Таблица пользователей
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Таблица результатов тестов
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS test_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    level TEXT,
-                    mode TEXT,
-                    correct_answers INTEGER,
-                    total_questions INTEGER,
-                    percentage REAL,
-                    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-
-            # Таблица текущих сессий
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sessions (
-                    user_id INTEGER PRIMARY KEY,
-                    level TEXT,
-                    mode TEXT,
-                    questions_json TEXT,
-                    current_question INTEGER,
-                    correct_answers INTEGER,
-                    total_questions INTEGER,
-                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-        logger.info("✅ Database initialized successfully")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize database: {e}")
-        raise
-
-def save_user(user_id: int, username: str, first_name: str):
-    """Сохранение пользователя"""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR IGNORE INTO users (user_id, username, first_name)
-                VALUES (?, ?, ?)
-            ''', (user_id, username, first_name))
-    except Exception as e:
-        logger.error(f"Error saving user {user_id}: {e}")
-
-def save_test_result(user_id: int, level: str, mode: str, correct: int, total: int):
-    """Сохранение результата теста"""
-    try:
-        percentage = (correct / total) * 100 if total > 0 else 0
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO test_results (user_id, level, mode, correct_answers, total_questions, percentage)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, level, mode, correct, total, percentage))
-        logger.info(f"Saved test result for user {user_id}: {correct}/{total} ({percentage:.1f}%)")
-    except Exception as e:
-        logger.error(f"Error saving test result for user {user_id}: {e}")
-
-def get_user_stats(user_id: int):
-    """Получение статистики пользователя"""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-
-            # Общая статистика
-            cursor.execute('''
-                SELECT
-                    COUNT(*) as total_tests,
-                    AVG(percentage) as avg_percentage,
-                    MAX(percentage) as best_percentage,
-                    SUM(correct_answers) as total_correct,
-                    SUM(total_questions) as total_questions
-                FROM test_results
-                WHERE user_id = ?
-            ''', (user_id,))
-            overall = cursor.fetchone()
-
-            # Статистика по уровням
-            cursor.execute('''
-                SELECT
-                    level,
-                    COUNT(*) as attempts,
-                    AVG(percentage) as avg_percentage,
-                    MAX(percentage) as best_percentage
-                FROM test_results
-                WHERE user_id = ?
-                GROUP BY level
-            ''', (user_id,))
-            by_level = cursor.fetchall()
-
-            # Последние 5 тестов
-            cursor.execute('''
-                SELECT level, mode, percentage, completed_at
-                FROM test_results
-                WHERE user_id = ?
-                ORDER BY completed_at DESC
-                LIMIT 5
-            ''', (user_id,))
-            recent = cursor.fetchall()
-
-            return {
-                'overall': dict(overall) if overall else None,
-                'by_level': [dict(row) for row in by_level],
-                'recent': [dict(row) for row in recent]
-            }
-    except Exception as e:
-        logger.error(f"Error getting stats for user {user_id}: {e}")
-        return None
-
-def save_session(user_id: int, data: dict):
-    """Сохранение текущей сессии"""
-    try:
-        import json
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO sessions
-                (user_id, level, mode, questions_json, current_question, correct_answers, total_questions)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                user_id,
-                data['level'],
-                data.get('mode', 'full'),
-                json.dumps(data['questions']),
-                data['current_question'],
-                data['correct_answers'],
-                data['total_questions']
-            ))
-    except Exception as e:
-        logger.error(f"Error saving session for user {user_id}: {e}")
-
-def load_session(user_id: int):
-    """Загрузка сессии"""
-    try:
-        import json
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM sessions WHERE user_id = ?', (user_id,))
-            row = cursor.fetchone()
-            if row:
-                return {
-                    'level': row['level'],
-                    'mode': row['mode'],
-                    'questions': json.loads(row['questions_json']),
-                    'current_question': row['current_question'],
-                    'correct_answers': row['correct_answers'],
-                    'total_questions': row['total_questions']
-                }
-    except Exception as e:
-        logger.error(f"Error loading session for user {user_id}: {e}")
-    return None
-
-def delete_session(user_id: int):
-    """Удаление сессии"""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM sessions WHERE user_id = ?', (user_id,))
-    except Exception as e:
-        logger.error(f"Error deleting session for user {user_id}: {e}")
-
-# ==================== QUESTIONS ====================
-
-# Расширенная база вопросов (50 вопросов на уровень)
 QUESTIONS = {
     'junior': [
         {
@@ -240,7 +17,7 @@ QUESTIONS = {
         {
             'question': 'Что такое баг (дефект)?',
             'options': [
-                'Отклонение результата\nот ожидаемого',
+                'Отклонение результата от ожидаемого',
                 'Новая функция',
                 'Документация',
                 'Тестовый сценарий'
@@ -262,7 +39,7 @@ QUESTIONS = {
         {
             'question': 'Что такое регрессионное тестирование?',
             'options': [
-                'Проверка старого\nфункционала после изменений',
+                'Проверка старого функционала после изменений',
                 'Тестирование новых функций',
                 'Тестирование производительности',
                 'Тестирование безопасности'
@@ -273,7 +50,7 @@ QUESTIONS = {
         {
             'question': 'Что такое тест-кейс?',
             'options': [
-                'Документ с шагами\nи ожидаемыми результатами',
+                'Документ с шагами и ожидаемыми результатами',
                 'Список найденных багов',
                 'План тестирования',
                 'Отчет о тестировании'
@@ -284,7 +61,7 @@ QUESTIONS = {
         {
             'question': 'Что проверяется при функциональном тестировании?',
             'options': [
-                'Соответствие функций\nтребованиям',
+                'Соответствие функций требованиям',
                 'Скорость работы',
                 'Безопасность системы',
                 'Дизайн интерфейса'
@@ -295,7 +72,7 @@ QUESTIONS = {
         {
             'question': 'Что такое smoke testing?',
             'options': [
-                'Быстрая проверка основного\nфункционала после сборки',
+                'Быстрая проверка основного функционала',
                 'Тестирование в дыму',
                 'Тестирование производительности',
                 'Финальное тестирование'
@@ -306,7 +83,7 @@ QUESTIONS = {
         {
             'question': 'Приоритет критического бага?',
             'options': [
-                'Highest/Critical -\nтребует срочного исправления',
+                'Highest/Critical - требует срочного исправления',
                 'Low - можно потом',
                 'Medium - в следующем релизе',
                 'Trivial - не требуется'
@@ -317,8 +94,8 @@ QUESTIONS = {
         {
             'question': 'Что такое верификация (verification)?',
             'options': [
-                'Проверка соответствия\nпродукта спецификации',
-                'Проверка ожиданий\nпользователей',
+                'Проверка соответствия продукта спецификации',
+                'Проверка ожиданий пользователей',
                 'Исправление багов',
                 'Написание тестов'
             ],
@@ -328,8 +105,8 @@ QUESTIONS = {
         {
             'question': 'Что такое валидация (validation)?',
             'options': [
-                'Проверка соответствия\nожиданиям пользователей',
-                'Проверка соответствия\nспецификации',
+                'Проверка соответствия ожиданиям пользователей',
+                'Проверка соответствия спецификации',
                 'Установка программы',
                 'Удаление программы'
             ],
@@ -339,7 +116,7 @@ QUESTIONS = {
         {
             'question': 'Что такое санитарное тестирование?',
             'options': [
-                'Проверка основных функций\nпосле исправления багов',
+                'Проверка основных функций после исправления',
                 'Полное тестирование',
                 'Тестирование новых функций',
                 'Тестирование интерфейса'
@@ -350,7 +127,7 @@ QUESTIONS = {
         {
             'question': 'Что такое acceptance testing?',
             'options': [
-                'Приемочное тестирование\nсо стороны заказчика',
+                'Приемочное тестирование со стороны заказчика',
                 'Тестирование программистом',
                 'Автоматическое тестирование',
                 'Тестирование производительности'
@@ -361,7 +138,7 @@ QUESTIONS = {
         {
             'question': 'Жизненный цикл дефекта: правильный порядок?',
             'options': [
-                'New → Assigned → Fixed\n→ Verified → Closed',
+                'New → Assigned → Fixed → Verified → Closed',
                 'Open → Close',
                 'Found → Deleted',
                 'Bug → No Bug'
@@ -372,7 +149,7 @@ QUESTIONS = {
         {
             'question': 'Что такое test plan?',
             'options': [
-                'Документ с описанием\nстратегии тестирования',
+                'Документ с описанием стратегии тестирования',
                 'Список тест-кейсов',
                 'Список багов',
                 'Расписание тестов'
@@ -383,7 +160,7 @@ QUESTIONS = {
         {
             'question': 'Что такое exploratory testing?',
             'options': [
-                'Исследовательское тестирование\nбез строгих сценариев',
+                'Исследовательское тестирование без сценариев',
                 'Автоматизированное тестирование',
                 'Тестирование по документации',
                 'Повторное тестирование'
@@ -394,7 +171,7 @@ QUESTIONS = {
         {
             'question': 'Что такое positive testing?',
             'options': [
-                'Проверка с корректными\nвходными данными',
+                'Проверка с корректными входными данными',
                 'Проверка с некорректными данными',
                 'Позитивное отношение к багам',
                 'Быстрое тестирование'
@@ -405,7 +182,7 @@ QUESTIONS = {
         {
             'question': 'Что такое negative testing?',
             'options': [
-                'Проверка с некорректными\nвходными данными',
+                'Проверка с некорректными входными данными',
                 'Проверка с корректными данными',
                 'Негативное отношение к системе',
                 'Медленное тестирование'
@@ -416,7 +193,7 @@ QUESTIONS = {
         {
             'question': 'Что такое boundary testing?',
             'options': [
-                'Тестирование граничных\nзначений',
+                'Тестирование граничных значений',
                 'Тестирование границ экрана',
                 'Тестирование рамок',
                 'Тестирование лимитов времени'
@@ -427,9 +204,9 @@ QUESTIONS = {
         {
             'question': 'Severity vs Priority - в чем разница?',
             'options': [
-                'Severity - влияние на систему,\nPriority - срочность исправления',
+                'Severity - влияние, Priority - срочность',
                 'Это синонимы',
-                'Severity для багов,\nPriority для фич',
+                'Severity для багов, Priority для фич',
                 'Нет разницы'
             ],
             'correct': 0,
@@ -438,7 +215,7 @@ QUESTIONS = {
         {
             'question': 'Что такое use case?',
             'options': [
-                'Описание взаимодействия\nпользователя с системой',
+                'Описание взаимодействия пользователя с системой',
                 'Список тест-кейсов',
                 'Описание бага',
                 'Документация кода'
@@ -446,11 +223,10 @@ QUESTIONS = {
             'correct': 0,
             'explanation': 'Use case описывает сценарий использования системы реальным пользователем для достижения цели.'
         },
-        # Добавляем еще 30 вопросов для Junior
         {
             'question': 'Что такое SDLC?',
             'options': [
-                'Software Development\nLife Cycle',
+                'Software Development Life Cycle',
                 'System Data Life Code',
                 'Standard Development Link',
                 'Secure Data Life Cycle'
@@ -461,7 +237,7 @@ QUESTIONS = {
         {
             'question': 'Что такое STLC?',
             'options': [
-                'Software Testing\nLife Cycle',
+                'Software Testing Life Cycle',
                 'System Testing Link Code',
                 'Standard Test Life Check',
                 'Secure Testing Life Cycle'
@@ -472,7 +248,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Ad-hoc тестирование?',
             'options': [
-                'Неформальное тестирование\nбез подготовки',
+                'Неформальное тестирование без подготовки',
                 'Тестирование рекламы',
                 'Автоматическое тестирование',
                 'Регрессионное тестирование'
@@ -483,7 +259,7 @@ QUESTIONS = {
         {
             'question': 'Что такое test suite?',
             'options': [
-                'Набор тест-кейсов\nдля конкретной цели',
+                'Набор тест-кейсов для конкретной цели',
                 'Один тест-кейс',
                 'Отчет о тестировании',
                 'Инструмент тестирования'
@@ -494,7 +270,7 @@ QUESTIONS = {
         {
             'question': 'Что такое test data?',
             'options': [
-                'Данные используемые\nво время тестирования',
+                'Данные используемые во время тестирования',
                 'Результаты тестов',
                 'Отчеты о багах',
                 'Документация'
@@ -505,7 +281,7 @@ QUESTIONS = {
         {
             'question': 'Что такое baseline в тестировании?',
             'options': [
-                'Утвержденная версия\nартефакта проекта',
+                'Утвержденная версия артефакта проекта',
                 'Линия на графике',
                 'Начало проекта',
                 'Конец тестирования'
@@ -516,7 +292,7 @@ QUESTIONS = {
         {
             'question': 'Что такое traceability matrix?',
             'options': [
-                'Связь требований\nс тест-кейсами',
+                'Связь требований с тест-кейсами',
                 'График багов',
                 'Матрица приоритетов',
                 'Таблица результатов'
@@ -527,7 +303,7 @@ QUESTIONS = {
         {
             'question': 'Что такое entry criteria?',
             'options': [
-                'Условия для начала\nтестирования',
+                'Условия для начала тестирования',
                 'Вход в систему',
                 'Первый тест',
                 'Регистрация пользователя'
@@ -538,7 +314,7 @@ QUESTIONS = {
         {
             'question': 'Что такое exit criteria?',
             'options': [
-                'Условия для завершения\nтестирования',
+                'Условия для завершения тестирования',
                 'Выход из системы',
                 'Последний тест',
                 'Удаление аккаунта'
@@ -549,7 +325,7 @@ QUESTIONS = {
         {
             'question': 'Что такое defect density?',
             'options': [
-                'Количество дефектов\nна единицу кода',
+                'Количество дефектов на единицу кода',
                 'Размер бага',
                 'Скорость исправления',
                 'Приоритет дефекта'
@@ -560,7 +336,7 @@ QUESTIONS = {
         {
             'question': 'Что такое re-testing?',
             'options': [
-                'Повторное тестирование\nисправленного бага',
+                'Повторное тестирование исправленного бага',
                 'Регрессионное тестирование',
                 'Первое тестирование',
                 'Автоматическое тестирование'
@@ -571,7 +347,7 @@ QUESTIONS = {
         {
             'question': 'Что такое build?',
             'options': [
-                'Скомпилированная версия\nприложения',
+                'Скомпилированная версия приложения',
                 'Инструмент разработки',
                 'Тестовый сервер',
                 'База данных'
@@ -582,7 +358,7 @@ QUESTIONS = {
         {
             'question': 'Что такое release?',
             'options': [
-                'Версия ПО переданная\nпользователям',
+                'Версия ПО переданная пользователям',
                 'Удаление приложения',
                 'Тестовая версия',
                 'Исходный код'
@@ -593,7 +369,7 @@ QUESTIONS = {
         {
             'question': 'Что такое hotfix?',
             'options': [
-                'Срочное исправление\nкритического бага',
+                'Срочное исправление критического бага',
                 'Плановое обновление',
                 'Новая функция',
                 'Улучшение производительности'
@@ -604,7 +380,7 @@ QUESTIONS = {
         {
             'question': 'Что такое environment?',
             'options': [
-                'Окружение для\nзапуска приложения',
+                'Окружение для запуска приложения',
                 'Природная среда',
                 'Офис разработчиков',
                 'Язык программирования'
@@ -615,7 +391,7 @@ QUESTIONS = {
         {
             'question': 'Что такое staging environment?',
             'options': [
-                'Предпродакшн окружение\nдля финального тестирования',
+                'Предпродакшн окружение для финального теста',
                 'Разработческое окружение',
                 'Тестовый сервер',
                 'Локальная машина'
@@ -626,7 +402,7 @@ QUESTIONS = {
         {
             'question': 'Что такое production environment?',
             'options': [
-                'Боевое окружение\nс реальными пользователями',
+                'Боевое окружение с реальными пользователями',
                 'Тестовый сервер',
                 'Локальная машина',
                 'Резервная копия'
@@ -637,7 +413,7 @@ QUESTIONS = {
         {
             'question': 'Что такое UAT?',
             'options': [
-                'User Acceptance Testing -\nпользовательское тестирование',
+                'User Acceptance Testing',
                 'Automated Testing',
                 'Unit Testing',
                 'Universal Testing'
@@ -646,11 +422,11 @@ QUESTIONS = {
             'explanation': 'UAT - финальное тестирование реальными пользователями перед релизом.'
         },
         {
-            'question': 'Что такое smoke test vs sanity test?',
+            'question': 'Smoke test vs Sanity test - разница?',
             'options': [
-                'Smoke - базовая проверка,\nSanity - проверка исправлений',
+                'Smoke - базовая проверка, Sanity - исправления',
                 'Это одно и то же',
-                'Smoke для багов,\nSanity для фич',
+                'Smoke для багов, Sanity для фич',
                 'Нет разницы'
             ],
             'correct': 0,
@@ -659,7 +435,7 @@ QUESTIONS = {
         {
             'question': 'Что такое alpha testing?',
             'options': [
-                'Внутреннее тестирование\nкомандой разработки',
+                'Внутреннее тестирование командой разработки',
                 'Тестирование пользователями',
                 'Автоматическое тестирование',
                 'Финальное тестирование'
@@ -670,7 +446,7 @@ QUESTIONS = {
         {
             'question': 'Что такое beta testing?',
             'options': [
-                'Тестирование ограниченной\nгруппой пользователей',
+                'Тестирование ограниченной группой пользователей',
                 'Внутреннее тестирование',
                 'Автоматическое тестирование',
                 'Тестирование багов'
@@ -681,7 +457,7 @@ QUESTIONS = {
         {
             'question': 'Что такое GUI testing?',
             'options': [
-                'Тестирование графического\nинтерфейса пользователя',
+                'Тестирование графического интерфейса',
                 'Тестирование API',
                 'Тестирование БД',
                 'Тестирование кода'
@@ -692,7 +468,7 @@ QUESTIONS = {
         {
             'question': 'Что такое usability testing?',
             'options': [
-                'Проверка удобства\nиспользования',
+                'Проверка удобства использования',
                 'Проверка функциональности',
                 'Проверка производительности',
                 'Проверка безопасности'
@@ -703,7 +479,7 @@ QUESTIONS = {
         {
             'question': 'Что такое compatibility testing?',
             'options': [
-                'Проверка работы на\nразных платформах',
+                'Проверка работы на разных платформах',
                 'Проверка функций',
                 'Проверка скорости',
                 'Проверка багов'
@@ -714,7 +490,7 @@ QUESTIONS = {
         {
             'question': 'Что такое installation testing?',
             'options': [
-                'Проверка процесса\nустановки/удаления',
+                'Проверка процесса установки/удаления',
                 'Проверка интерфейса',
                 'Проверка функций',
                 'Проверка данных'
@@ -725,7 +501,7 @@ QUESTIONS = {
         {
             'question': 'Что такое monkey testing?',
             'options': [
-                'Случайное тестирование\nбез системного подхода',
+                'Случайное тестирование без системного подхода',
                 'Тестирование обезьян',
                 'Автоматическое тестирование',
                 'Стресс-тестирование'
@@ -736,7 +512,7 @@ QUESTIONS = {
         {
             'question': 'Что такое локализация (L10n)?',
             'options': [
-                'Адаптация продукта\nдля конкретного региона',
+                'Адаптация продукта для конкретного региона',
                 'Поиск багов',
                 'Установка приложения',
                 'Тестирование скорости'
@@ -747,7 +523,7 @@ QUESTIONS = {
         {
             'question': 'Что такое интернационализация (i18n)?',
             'options': [
-                'Подготовка продукта\nдля разных языков',
+                'Подготовка продукта для разных языков',
                 'Интернет-тестирование',
                 'Международная доставка',
                 'Тестирование связи'
@@ -758,7 +534,7 @@ QUESTIONS = {
         {
             'question': 'Что такое test report?',
             'options': [
-                'Документ с результатами\nтестирования',
+                'Документ с результатами тестирования',
                 'План тестирования',
                 'Список багов',
                 'Тест-кейс'
@@ -769,7 +545,7 @@ QUESTIONS = {
         {
             'question': 'Что такое root cause?',
             'options': [
-                'Первопричина появления\nдефекта',
+                'Первопричина появления дефекта',
                 'Корень дерева',
                 'Главный тестировщик',
                 'Первый баг'
@@ -782,7 +558,7 @@ QUESTIONS = {
         {
             'question': 'Что такое API тестирование?',
             'options': [
-                'Тестирование программных\nинтерфейсов приложения',
+                'Тестирование программных интерфейсов',
                 'Тестирование UI',
                 'Тестирование БД',
                 'Тестирование сети'
@@ -793,7 +569,7 @@ QUESTIONS = {
         {
             'question': 'Основные HTTP методы?',
             'options': [
-                'GET, POST, PUT,\nDELETE, PATCH',
+                'GET, POST, PUT, DELETE, PATCH',
                 'SEND, RECEIVE, UPDATE',
                 'READ, WRITE, EXECUTE',
                 'OPEN, CLOSE, SAVE'
@@ -804,7 +580,7 @@ QUESTIONS = {
         {
             'question': 'Что такое SQL injection?',
             'options': [
-                'Внедрение вредоносного\nSQL кода в запрос',
+                'Внедрение вредоносного SQL кода в запрос',
                 'Оптимизация БД',
                 'Резервное копирование',
                 'Тип индекса в БД'
@@ -815,7 +591,7 @@ QUESTIONS = {
         {
             'question': 'Что проверяется при load testing?',
             'options': [
-                'Поведение системы\nпод нагрузкой',
+                'Поведение системы под нагрузкой',
                 'Функциональность',
                 'Безопасность',
                 'Удобство интерфейса'
@@ -826,7 +602,7 @@ QUESTIONS = {
         {
             'question': 'Что такое CI/CD?',
             'options': [
-                'Continuous Integration/\nContinuous Delivery',
+                'Continuous Integration/Continuous Delivery',
                 'Code Integration',
                 'Computer Integration',
                 'Critical Integration'
@@ -848,7 +624,7 @@ QUESTIONS = {
         {
             'question': 'Что такое mock объект?',
             'options': [
-                'Имитация реального\nобъекта для тестов',
+                'Имитация реального объекта для тестов',
                 'Реальный объект БД',
                 'Файл конфигурации',
                 'Тип переменной'
@@ -859,7 +635,7 @@ QUESTIONS = {
         {
             'question': 'Принцип DRY в тестировании?',
             'options': [
-                'Don\'t Repeat Yourself -\nне повторяйся',
+                "Don't Repeat Yourself - не повторяйся",
                 'Do Repeat Yourself',
                 'Delete Repeated Years',
                 'Debug Ready Yearly'
@@ -870,7 +646,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Page Object Model?',
             'options': [
-                'Паттерн где каждая\nстраница - класс',
+                'Паттерн где каждая страница - класс',
                 'Модель БД',
                 'Тип документации',
                 'Метод ручного тестирования'
@@ -881,7 +657,7 @@ QUESTIONS = {
         {
             'question': 'Что проверяет security testing?',
             'options': [
-                'Защищенность от\nнесанкционированного доступа',
+                'Защищенность от несанкционированного доступа',
                 'Скорость работы',
                 'Функциональность',
                 'Внешний вид'
@@ -892,7 +668,7 @@ QUESTIONS = {
         {
             'question': 'Что такое REST API?',
             'options': [
-                'Архитектурный стиль для\nсетевых приложений',
+                'Архитектурный стиль для сетевых приложений',
                 'База данных',
                 'Язык программирования',
                 'Протокол шифрования'
@@ -914,7 +690,7 @@ QUESTIONS = {
         {
             'question': 'Что такое XPath?',
             'options': [
-                'Язык запросов для\nнавигации по XML/HTML',
+                'Язык запросов для навигации по XML/HTML',
                 'Протокол передачи данных',
                 'База данных',
                 'Язык программирования'
@@ -925,7 +701,7 @@ QUESTIONS = {
         {
             'question': 'Что такое CSS selector?',
             'options': [
-                'Паттерн для выбора\nэлементов на странице',
+                'Паттерн для выбора элементов на странице',
                 'Язык стилей',
                 'База данных',
                 'Протокол'
@@ -936,7 +712,7 @@ QUESTIONS = {
         {
             'question': 'Что такое stub?',
             'options': [
-                'Заглушка с\nпредопределенными ответами',
+                'Заглушка с предопределенными ответами',
                 'Реальный сервис',
                 'Тип базы данных',
                 'Протокол'
@@ -947,7 +723,7 @@ QUESTIONS = {
         {
             'question': 'Разница между mock и stub?',
             'options': [
-                'Mock проверяет вызовы,\nstub просто отвечает',
+                'Mock проверяет вызовы, stub просто отвечает',
                 'Нет разницы',
                 'Mock для unit, stub для API',
                 'Stub быстрее'
@@ -958,7 +734,7 @@ QUESTIONS = {
         {
             'question': 'Что такое API rate limiting?',
             'options': [
-                'Ограничение количества\nзапросов в единицу времени',
+                'Ограничение запросов в единицу времени',
                 'Скорость ответа API',
                 'Размер ответа',
                 'Время жизни токена'
@@ -969,7 +745,7 @@ QUESTIONS = {
         {
             'question': 'Что такое idempotency в API?',
             'options': [
-                'Повторный запрос дает\nтот же результат',
+                'Повторный запрос дает тот же результат',
                 'Быстрый ответ',
                 'Безопасный запрос',
                 'Кэшируемый запрос'
@@ -980,7 +756,7 @@ QUESTIONS = {
         {
             'question': 'Что такое smoke test suite?',
             'options': [
-                'Набор критических\nавтотестов для быстрой проверки',
+                'Набор критических автотестов для проверки',
                 'Все автотесты',
                 'Ручные тесты',
                 'Нагрузочные тесты'
@@ -991,7 +767,7 @@ QUESTIONS = {
         {
             'question': 'Что такое flaky test?',
             'options': [
-                'Тест который нестабильно\nпадает/проходит',
+                'Тест который нестабильно падает/проходит',
                 'Медленный тест',
                 'Пропущенный тест',
                 'Неправильный тест'
@@ -999,14 +775,13 @@ QUESTIONS = {
             'correct': 0,
             'explanation': 'Flaky test - нестабильный тест, который может упасть без изменений в коде.'
         },
-        # Добавляем еще 30 вопросов для Middle
         {
             'question': 'Что такое Selenium?',
             'options': [
-                'Фреймворк для автоматизации\nвеб-приложений',
+                'Фреймворк для автоматизации веб-приложений',
                 'Язык программирования',
                 'База данных',
-                'ОС'
+                'Операционная система'
             ],
             'correct': 0,
             'explanation': 'Selenium - популярный инструмент для автоматизации тестирования веб-приложений.'
@@ -1014,7 +789,7 @@ QUESTIONS = {
         {
             'question': 'Что такое WebDriver?',
             'options': [
-                'API для управления\nбраузером',
+                'API для управления браузером',
                 'Драйвер принтера',
                 'База данных',
                 'Сетевой протокол'
@@ -1025,7 +800,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Postman?',
             'options': [
-                'Инструмент для\nтестирования API',
+                'Инструмент для тестирования API',
                 'Почтовый клиент',
                 'База данных',
                 'Веб-сервер'
@@ -1036,7 +811,7 @@ QUESTIONS = {
         {
             'question': 'Что такое assertion в тестах?',
             'options': [
-                'Проверка ожидаемого\nрезультата',
+                'Проверка ожидаемого результата',
                 'Создание данных',
                 'Удаление данных',
                 'Логирование'
@@ -1047,7 +822,7 @@ QUESTIONS = {
         {
             'question': 'Что такое test fixture?',
             'options': [
-                'Подготовка окружения\nперед тестами',
+                'Подготовка окружения перед тестами',
                 'Сломанный тест',
                 'Баг в коде',
                 'Отчет о тестах'
@@ -1058,7 +833,7 @@ QUESTIONS = {
         {
             'question': 'Что такое setUp и tearDown?',
             'options': [
-                'Методы подготовки\nи очистки в тестах',
+                'Методы подготовки и очистки в тестах',
                 'Команды БД',
                 'HTTP методы',
                 'Типы багов'
@@ -1069,7 +844,7 @@ QUESTIONS = {
         {
             'question': 'Что такое test coverage?',
             'options': [
-                'Процент кода покрытого\nтестами',
+                'Процент кода покрытого тестами',
                 'Количество тестов',
                 'Скорость тестирования',
                 'Количество багов'
@@ -1080,7 +855,7 @@ QUESTIONS = {
         {
             'question': 'Что такое unit test?',
             'options': [
-                'Тест отдельной\nфункции/метода',
+                'Тест отдельной функции/метода',
                 'Тест всей системы',
                 'Тест интерфейса',
                 'Тест производительности'
@@ -1091,7 +866,7 @@ QUESTIONS = {
         {
             'question': 'Что такое integration test?',
             'options': [
-                'Тест взаимодействия\nмежду компонентами',
+                'Тест взаимодействия между компонентами',
                 'Тест одной функции',
                 'Тест интерфейса',
                 'Тест безопасности'
@@ -1102,7 +877,7 @@ QUESTIONS = {
         {
             'question': 'Что такое E2E testing?',
             'options': [
-                'End-to-End тестирование\nвсего пути пользователя',
+                'End-to-End тестирование всего пути',
                 'Тест одной функции',
                 'Тест API',
                 'Тест БД'
@@ -1113,7 +888,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Docker в тестировании?',
             'options': [
-                'Контейнеризация окружения\nдля тестов',
+                'Контейнеризация окружения для тестов',
                 'База данных',
                 'Язык программирования',
                 'Фреймворк тестирования'
@@ -1124,7 +899,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Jenkins?',
             'options': [
-                'Инструмент для CI/CD\nавтоматизации',
+                'Инструмент для CI/CD автоматизации',
                 'Язык программирования',
                 'База данных',
                 'Браузер'
@@ -1135,7 +910,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Git в контексте тестирования?',
             'options': [
-                'Система контроля версий\nдля кода и тестов',
+                'Система контроля версий для кода и тестов',
                 'Инструмент тестирования',
                 'База данных',
                 'Сервер приложений'
@@ -1146,7 +921,7 @@ QUESTIONS = {
         {
             'question': 'Что такое regression suite?',
             'options': [
-                'Набор тестов для проверки\nстарого функционала',
+                'Набор тестов для проверки старого функционала',
                 'Новые тесты',
                 'Ручные тесты',
                 'Тесты производительности'
@@ -1157,7 +932,7 @@ QUESTIONS = {
         {
             'question': 'Что такое data-driven testing?',
             'options': [
-                'Тесты с разными\nнаборами данных',
+                'Тесты с разными наборами данных',
                 'Тестирование БД',
                 'Ручное тестирование',
                 'Визуальное тестирование'
@@ -1168,7 +943,7 @@ QUESTIONS = {
         {
             'question': 'Что такое keyword-driven testing?',
             'options': [
-                'Тесты на основе\nключевых слов-действий',
+                'Тесты на основе ключевых слов-действий',
                 'Поиск по ключевым словам',
                 'Тестирование текста',
                 'SEO тестирование'
@@ -1179,7 +954,7 @@ QUESTIONS = {
         {
             'question': 'Что такое BDD фреймворк Cucumber?',
             'options': [
-                'Инструмент для тестов\nна языке Gherkin',
+                'Инструмент для тестов на языке Gherkin',
                 'База данных',
                 'Язык программирования',
                 'Веб-сервер'
@@ -1190,7 +965,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Gherkin?',
             'options': [
-                'Язык для описания\nповедения (Given-When-Then)',
+                'Язык для описания поведения (Given-When-Then)',
                 'Язык программирования',
                 'База данных',
                 'Протокол'
@@ -1201,7 +976,7 @@ QUESTIONS = {
         {
             'question': 'Что такое headless browser?',
             'options': [
-                'Браузер без\nграфического интерфейса',
+                'Браузер без графического интерфейса',
                 'Старый браузер',
                 'Мобильный браузер',
                 'Защищенный браузер'
@@ -1212,7 +987,7 @@ QUESTIONS = {
         {
             'question': 'Что такое explicit wait?',
             'options': [
-                'Ожидание конкретного\nусловия',
+                'Ожидание конкретного условия',
                 'Фиксированная задержка',
                 'Ожидание без условий',
                 'Пропуск ожидания'
@@ -1223,7 +998,7 @@ QUESTIONS = {
         {
             'question': 'Что такое implicit wait?',
             'options': [
-                'Глобальное ожидание\nпоиска элементов',
+                'Глобальное ожидание поиска элементов',
                 'Условное ожидание',
                 'Ожидание без задержки',
                 'Ожидание клика'
@@ -1234,7 +1009,7 @@ QUESTIONS = {
         {
             'question': 'Что такое OAuth в тестировании?',
             'options': [
-                'Протокол авторизации\nчерез сторонние сервисы',
+                'Протокол авторизации через сторонние сервисы',
                 'База данных',
                 'Фреймворк тестирования',
                 'Язык запросов'
@@ -1245,7 +1020,7 @@ QUESTIONS = {
         {
             'question': 'Что такое JWT?',
             'options': [
-                'JSON Web Token для\nаутентификации',
+                'JSON Web Token для аутентификации',
                 'Язык программирования',
                 'База данных',
                 'Протокол передачи'
@@ -1256,7 +1031,7 @@ QUESTIONS = {
         {
             'question': 'Что такое CORS?',
             'options': [
-                'Cross-Origin Resource Sharing\nдля безопасности',
+                'Cross-Origin Resource Sharing для безопасности',
                 'Тип базы данных',
                 'Язык программирования',
                 'Фреймворк'
@@ -1267,7 +1042,7 @@ QUESTIONS = {
         {
             'question': 'Что такое XSS атака?',
             'options': [
-                'Cross-Site Scripting -\nвнедрение скриптов',
+                'Cross-Site Scripting - внедрение скриптов',
                 'Тип базы данных',
                 'Метод оптимизации',
                 'Протокол шифрования'
@@ -1278,7 +1053,7 @@ QUESTIONS = {
         {
             'question': 'Что такое CSRF атака?',
             'options': [
-                'Cross-Site Request Forgery -\nподделка запросов',
+                'Cross-Site Request Forgery - подделка запросов',
                 'Тип шифрования',
                 'Метод кэширования',
                 'Протокол передачи'
@@ -1289,7 +1064,7 @@ QUESTIONS = {
         {
             'question': 'Что такое TestNG?',
             'options': [
-                'Фреймворк тестирования\nдля Java',
+                'Фреймворк тестирования для Java',
                 'База данных',
                 'Язык программирования',
                 'Веб-сервер'
@@ -1300,7 +1075,7 @@ QUESTIONS = {
         {
             'question': 'Что такое JUnit?',
             'options': [
-                'Unit testing фреймворк\nдля Java',
+                'Unit testing фреймворк для Java',
                 'База данных',
                 'IDE',
                 'Язык программирования'
@@ -1311,7 +1086,7 @@ QUESTIONS = {
         {
             'question': 'Что такое pytest?',
             'options': [
-                'Testing фреймворк\nдля Python',
+                'Testing фреймворк для Python',
                 'База данных',
                 'Веб-фреймворк',
                 'Язык программирования'
@@ -1322,7 +1097,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Allure Report?',
             'options': [
-                'Инструмент для красивых\nотчетов тестирования',
+                'Инструмент для красивых отчетов тестирования',
                 'База данных',
                 'Фреймворк тестирования',
                 'Язык программирования'
@@ -1335,7 +1110,7 @@ QUESTIONS = {
         {
             'question': 'Что такое TDD?',
             'options': [
-                'Методология где тесты\nпишутся до кода',
+                'Методология где тесты пишутся до кода',
                 'Тесты после кода',
                 'Инструмент тестирования',
                 'Язык программирования'
@@ -1346,7 +1121,7 @@ QUESTIONS = {
         {
             'question': 'Что такое BDD?',
             'options': [
-                'Методология на основе\nописания поведения',
+                'Методология на основе описания поведения',
                 'Тип БД',
                 'Инструмент автоматизации',
                 'Протокол передачи данных'
@@ -1357,7 +1132,7 @@ QUESTIONS = {
         {
             'question': 'Основные метрики качества кода?',
             'options': [
-                'Code Coverage, Cyclomatic\nComplexity, Technical Debt',
+                'Code Coverage, Cyclomatic Complexity, Tech Debt',
                 'Только строки кода',
                 'Только функции',
                 'Только классы'
@@ -1368,7 +1143,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Contract Testing?',
             'options': [
-                'Тестирование контрактов\nмежду микросервисами',
+                'Тестирование контрактов между микросервисами',
                 'Тестирование юр. документов',
                 'Тестирование UI',
                 'Тестирование БД'
@@ -1379,7 +1154,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Fuzz Testing?',
             'options': [
-                'Поиск уязвимостей через\nслучайные данные',
+                'Поиск уязвимостей через случайные данные',
                 'Unit Testing',
                 'Integration Testing',
                 'Smoke Testing'
@@ -1390,7 +1165,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Chaos Engineering?',
             'options': [
-                'Внедрение отказов для\nпроверки отказоустойчивости',
+                'Внедрение отказов для проверки отказоустойчивости',
                 'Беспорядочное тестирование',
                 'Тестирование без плана',
                 'Тестирование хаотичного кода'
@@ -1401,7 +1176,7 @@ QUESTIONS = {
         {
             'question': 'Что проверяет stress testing?',
             'options': [
-                'Поведение за пределами\nнормальной нагрузки',
+                'Поведение за пределами нормальной нагрузки',
                 'Функциональность',
                 'Удобство интерфейса',
                 'Цвета дизайна'
@@ -1412,7 +1187,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Shift-Left Testing?',
             'options': [
-                'Тестирование на\nранних этапах разработки',
+                'Тестирование на ранних этапах разработки',
                 'Тестирование левой части UI',
                 'Тестирование левой кнопки',
                 'Перенос тестов влево'
@@ -1423,7 +1198,7 @@ QUESTIONS = {
         {
             'question': 'Паттерны для тестовых данных?',
             'options': [
-                'Test Data Builder,\nObject Mother, Fixture',
+                'Test Data Builder, Object Mother, Fixture',
                 'Только Singleton',
                 'Только Factory',
                 'Только Observer'
@@ -1434,7 +1209,7 @@ QUESTIONS = {
         {
             'question': 'Что такое A/B тестирование?',
             'options': [
-                'Сравнение двух версий\nдля определения лучшей',
+                'Сравнение двух версий для определения лучшей',
                 'Тестирование букв',
                 'Тестирование первых функций',
                 'Альтернатива unit-тестам'
@@ -1445,7 +1220,7 @@ QUESTIONS = {
         {
             'question': 'Что такое mutation testing?',
             'options': [
-                'Проверка качества тестов\nчерез внесение мутаций в код',
+                'Проверка качества тестов через мутации в коде',
                 'Тестирование изменений',
                 'Генетические алгоритмы',
                 'Тестирование БД'
@@ -1456,7 +1231,7 @@ QUESTIONS = {
         {
             'question': 'Что такое property-based testing?',
             'options': [
-                'Тестирование свойств\nс автогенерацией данных',
+                'Тестирование свойств с автогенерацией данных',
                 'Тестирование объектов',
                 'Тестирование переменных',
                 'Юнит-тестирование'
@@ -1467,7 +1242,7 @@ QUESTIONS = {
         {
             'question': 'Test Pyramid - правильная структура?',
             'options': [
-                'Много unit → средне integration\n→ мало E2E',
+                'Много unit → средне integration → мало E2E',
                 'Много E2E → мало unit',
                 'Все типы поровну',
                 'Только unit тесты'
@@ -1478,7 +1253,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Test Double?',
             'options': [
-                'Общий термин для mock,\nstub, fake, spy, dummy',
+                'Общий термин для mock, stub, fake, spy, dummy',
                 'Двойное тестирование',
                 'Дублирование тестов',
                 'Два тестовых окружения'
@@ -1489,7 +1264,7 @@ QUESTIONS = {
         {
             'question': 'Что такое canary deployment?',
             'options': [
-                'Постепенный выкат новой\nверсии на часть пользователей',
+                'Постепенный выкат новой версии на часть юзеров',
                 'Тестирование птиц',
                 'Желтое окружение',
                 'Быстрый деплой'
@@ -1500,7 +1275,7 @@ QUESTIONS = {
         {
             'question': 'Что такое blue-green deployment?',
             'options': [
-                'Два идентичных окружения\nдля безопасного переключения',
+                'Два идентичных окружения для безопасного переключения',
                 'Цветовое кодирование',
                 'Два разных продукта',
                 'Стадии разработки'
@@ -1511,7 +1286,7 @@ QUESTIONS = {
         {
             'question': 'Что такое feature toggle?',
             'options': [
-                'Механизм включения/выключения\nфункций без деплоя',
+                'Механизм включения/выключения функций без деплоя',
                 'Переключатель в UI',
                 'Настройка БД',
                 'Конфигурация сервера'
@@ -1522,7 +1297,7 @@ QUESTIONS = {
         {
             'question': 'Что такое observability?',
             'options': [
-                'Способность понять состояние\nсистемы по её выходным данным',
+                'Способность понять состояние системы по выходным данным',
                 'Видимость кода',
                 'Мониторинг серверов',
                 'Логирование'
@@ -1533,7 +1308,7 @@ QUESTIONS = {
         {
             'question': 'В чем разница monitoring vs observability?',
             'options': [
-                'Monitoring - известные проблемы,\nobservability - неизвестные',
+                'Monitoring - известные проблемы, observability - нет',
                 'Нет разницы',
                 'Monitoring быстрее',
                 'Observability дешевле'
@@ -1544,7 +1319,7 @@ QUESTIONS = {
         {
             'question': 'Что такое synthetic monitoring?',
             'options': [
-                'Симуляция действий\nпользователей для проверки',
+                'Симуляция действий пользователей для проверки',
                 'Искусственный интеллект',
                 'Синтетические данные',
                 'Виртуальные машины'
@@ -1552,11 +1327,10 @@ QUESTIONS = {
             'correct': 0,
             'explanation': 'Synthetic monitoring использует скрипты для постоянной проверки доступности и производительности.'
         },
-        # Добавляем еще 30 вопросов для Senior
         {
             'question': 'Что такое Microservices Testing Strategy?',
             'options': [
-                'Тестирование сервисов\nнезависимо и их интеграций',
+                'Тестирование сервисов независимо и их интеграций',
                 'Тестирование маленьких файлов',
                 'Юнит-тестирование',
                 'Тестирование UI'
@@ -1567,7 +1341,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Service Virtualization?',
             'options': [
-                'Симуляция недоступных\nсервисов для тестов',
+                'Симуляция недоступных сервисов для тестов',
                 'Виртуальные машины',
                 'Облачные сервисы',
                 'Контейнеризация'
@@ -1578,7 +1352,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Consumer-Driven Contracts?',
             'options': [
-                'Контракты определяемые\nпотребителями API',
+                'Контракты определяемые потребителями API',
                 'Юридические договоры',
                 'Пользовательские соглашения',
                 'Конфигурация БД'
@@ -1589,7 +1363,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Performance Testing Strategy?',
             'options': [
-                'Load, Stress, Spike,\nEndurance, Scalability тесты',
+                'Load, Stress, Spike, Endurance, Scalability тесты',
                 'Только Load тесты',
                 'Только Unit тесты',
                 'Только UI тесты'
@@ -1600,7 +1374,7 @@ QUESTIONS = {
         {
             'question': 'Что такое JMeter?',
             'options': [
-                'Инструмент для\nнагрузочного тестирования',
+                'Инструмент для нагрузочного тестирования',
                 'Единица измерения',
                 'База данных',
                 'Язык программирования'
@@ -1611,7 +1385,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Gatling?',
             'options': [
-                'Инструмент нагрузочного\nтестирования на Scala',
+                'Инструмент нагрузочного тестирования на Scala',
                 'Пулемет',
                 'База данных',
                 'Веб-сервер'
@@ -1622,7 +1396,7 @@ QUESTIONS = {
         {
             'question': 'Что такое k6?',
             'options': [
-                'Современный инструмент\nload testing',
+                'Современный инструмент load testing',
                 'Версия Kubernetes',
                 'База данных',
                 'Протокол'
@@ -1633,7 +1407,7 @@ QUESTIONS = {
         {
             'question': 'Что такое APM (Application Performance Monitoring)?',
             'options': [
-                'Мониторинг производительности\nприложения в реальном времени',
+                'Мониторинг производительности приложения в реальном времени',
                 'Автоматическое тестирование',
                 'Управление проектами',
                 'Анализ багов'
@@ -1644,7 +1418,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Distributed Tracing?',
             'options': [
-                'Отслеживание запросов\nчерез микросервисы',
+                'Отслеживание запросов через микросервисы',
                 'Географическое тестирование',
                 'Тестирование кластеров',
                 'Балансировка нагрузки'
@@ -1655,7 +1429,7 @@ QUESTIONS = {
         {
             'question': 'Что такое SLI, SLO, SLA?',
             'options': [
-                'Indicators, Objectives,\nAgreements для качества сервиса',
+                'Indicators, Objectives, Agreements для качества',
                 'Типы тестов',
                 'Языки программирования',
                 'Протоколы связи'
@@ -1666,7 +1440,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Error Budget?',
             'options': [
-                'Допустимое количество\nошибок для инноваций',
+                'Допустимое количество ошибок для инноваций',
                 'Бюджет на исправление багов',
                 'Список ошибок',
                 'Стоимость тестирования'
@@ -1677,7 +1451,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Site Reliability Engineering (SRE)?',
             'options': [
-                'Практики обеспечения\nнадежности систем',
+                'Практики обеспечения надежности систем',
                 'Тестирование сайтов',
                 'Разработка фронтенда',
                 'Администрирование БД'
@@ -1688,7 +1462,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Infrastructure as Code (IaC)?',
             'options': [
-                'Управление инфраструктурой\nчерез код',
+                'Управление инфраструктурой через код',
                 'Код приложения',
                 'Тестовый код',
                 'Документация'
@@ -1699,7 +1473,7 @@ QUESTIONS = {
         {
             'question': 'Что такое GitOps?',
             'options': [
-                'Git как источник истины\nдля деплоя',
+                'Git как источник истины для деплоя',
                 'Операции с Git',
                 'Тестирование Git',
                 'Работа с репозиториями'
@@ -1710,7 +1484,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Kubernetes в контексте тестирования?',
             'options': [
-                'Оркестрация контейнеров\nдля тестовых окружений',
+                'Оркестрация контейнеров для тестовых окружений',
                 'База данных',
                 'Язык программирования',
                 'Фреймворк тестирования'
@@ -1721,7 +1495,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Test Containerization?',
             'options': [
-                'Запуск тестов в\nизолированных контейнерах',
+                'Запуск тестов в изолированных контейнерах',
                 'Упаковка тестов',
                 'Сжатие тестов',
                 'Шифрование тестов'
@@ -1732,7 +1506,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Visual Regression Testing?',
             'options': [
-                'Автоматическое сравнение\nскриншотов UI',
+                'Автоматическое сравнение скриншотов UI',
                 'Ручное тестирование дизайна',
                 'Тестирование цветов',
                 'Проверка шрифтов'
@@ -1743,7 +1517,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Accessibility Testing (a11y)?',
             'options': [
-                'Тестирование доступности\nдля людей с ограничениями',
+                'Тестирование доступности для людей с ограничениями',
                 'Тестирование доступа',
                 'Тестирование прав',
                 'Тестирование входа'
@@ -1754,7 +1528,7 @@ QUESTIONS = {
         {
             'question': 'Что такое WCAG?',
             'options': [
-                'Web Content Accessibility\nGuidelines - стандарты доступности',
+                'Web Content Accessibility Guidelines',
                 'Язык программирования',
                 'Протокол',
                 'База данных'
@@ -1765,7 +1539,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Security Testing Automation?',
             'options': [
-                'Автоматизация SAST, DAST,\nSCA для безопасности',
+                'Автоматизация SAST, DAST, SCA для безопасности',
                 'Ручное тестирование безопасности',
                 'Шифрование данных',
                 'Управление паролями'
@@ -1776,7 +1550,7 @@ QUESTIONS = {
         {
             'question': 'Что такое SAST?',
             'options': [
-                'Static Application Security\nTesting - анализ кода',
+                'Static Application Security Testing - анализ кода',
                 'Динамическое тестирование',
                 'Ручное тестирование',
                 'Нагрузочное тестирование'
@@ -1787,7 +1561,7 @@ QUESTIONS = {
         {
             'question': 'Что такое DAST?',
             'options': [
-                'Dynamic Application Security\nTesting - тест запущенного приложения',
+                'Dynamic App Security Testing - тест запущенного app',
                 'Статический анализ',
                 'Ручное тестирование',
                 'Юнит-тестирование'
@@ -1798,7 +1572,7 @@ QUESTIONS = {
         {
             'question': 'Что такое SCA (Software Composition Analysis)?',
             'options': [
-                'Анализ уязвимостей в\nсторонних библиотеках',
+                'Анализ уязвимостей в сторонних библиотеках',
                 'Анализ производительности',
                 'Анализ покрытия',
                 'Анализ архитектуры'
@@ -1809,7 +1583,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Penetration Testing?',
             'options': [
-                'Симуляция реальных атак\nна систему',
+                'Симуляция реальных атак на систему',
                 'Нагрузочное тестирование',
                 'Функциональное тестирование',
                 'Регрессионное тестирование'
@@ -1820,7 +1594,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Bug Bounty Program?',
             'options': [
-                'Программа вознаграждения\nза найденные уязвимости',
+                'Программа вознаграждения за найденные уязвимости',
                 'Список багов',
                 'Инструмент тестирования',
                 'Конкурс тестировщиков'
@@ -1831,7 +1605,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Test Impact Analysis?',
             'options': [
-                'Определение каких тестов\nзапускать при изменениях',
+                'Определение каких тестов запускать при изменениях',
                 'Анализ результатов',
                 'Оценка покрытия',
                 'Метрики производительности'
@@ -1842,7 +1616,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Parallel Test Execution?',
             'options': [
-                'Одновременный запуск\nтестов для скорости',
+                'Одновременный запуск тестов для скорости',
                 'Последовательное тестирование',
                 'Тестирование на двух машинах',
                 'Дублирование тестов'
@@ -1853,7 +1627,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Test Sharding?',
             'options': [
-                'Разделение тестов\nна группы для параллельности',
+                'Разделение тестов на группы для параллельности',
                 'Удаление тестов',
                 'Объединение тестов',
                 'Шифрование тестов'
@@ -1864,7 +1638,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Flaky Test Detection?',
             'options': [
-                'Автоматическое выявление\nнестабильных тестов',
+                'Автоматическое выявление нестабильных тестов',
                 'Поиск багов',
                 'Анализ покрытия',
                 'Метрики производительности'
@@ -1875,7 +1649,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Test Quarantine?',
             'options': [
-                'Изоляция flaky тестов\nот основного suite',
+                'Изоляция flaky тестов от основного suite',
                 'Удаление тестов',
                 'Блокировка CI',
                 'Пропуск тестов'
@@ -1885,533 +1659,3 @@ QUESTIONS = {
         }
     ]
 }
-
-# Хранилище данных пользователей в памяти (для быстрого доступа)
-user_data = {}
-
-# ==================== HELPER FUNCTIONS ====================
-
-def get_progress_bar(current: int, total: int, length: int = 10) -> str:
-    """Создание прогресс-бара"""
-    filled = int(length * current / total)
-    bar = '█' * filled + '░' * (length - filled)
-    return f"[{bar}] {current}/{total}"
-
-def format_test_mode(mode: str) -> str:
-    """Форматирование названия режима"""
-    modes = {
-        'full': 'Полный тест (20 вопросов)',
-        'quick': 'Быстрый тест (10 вопросов)'
-    }
-    return modes.get(mode, mode)
-
-# ==================== COMMAND HANDLERS ====================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Расширенное стартовое сообщение с выбором режима и уровня"""
-    try:
-        user_id = update.message.from_user.id
-        username = update.message.from_user.username or ""
-        first_name = update.message.from_user.first_name or "друг"
-
-        # Сохраняем пользователя
-        save_user(user_id, username, first_name)
-
-        # Удаляем старую сессию если есть
-        delete_session(user_id)
-        if user_id in user_data:
-            del user_data[user_id]
-
-        keyboard = [
-            [InlineKeyboardButton("Junior QA 🌱", callback_data='select_junior')],
-            [InlineKeyboardButton("Middle QA 🚀", callback_data='select_middle')],
-            [InlineKeyboardButton("Senior QA 👑", callback_data='select_senior')],
-            [InlineKeyboardButton("📊 Моя статистика", callback_data='show_stats')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        welcome_text = (
-            f'👋 Привет, {first_name}!\n\n'
-            f'Я — твой персональный помощник для подготовки к собеседованию на позицию QA Engineer.\n\n'
-            f'🎯 <b>Что я умею:</b>\n'
-            f'✅ Проверяю знания по 3 уровням сложности\n'
-            f'✅ Два режима тестирования (полный и быстрый)\n'
-            f'✅ Даю подробные объяснения к каждому ответу\n'
-            f'✅ Сохраняю статистику и показываю прогресс\n'
-            f'✅ Показываю прогресс-бар во время теста\n\n'
-            f'📚 <b>Уровни тестирования:</b>\n'
-            f'🌱 <b>Junior</b> — основы тестирования, базовая терминология (50 вопросов)\n'
-            f'🚀 <b>Middle</b> — API, автоматизация, CI/CD, безопасность (50 вопросов)\n'
-            f'👑 <b>Senior</b> — TDD/BDD, метрики, архитектурные подходы (50 вопросов)\n\n'
-            f'🎮 <b>Режимы тестирования:</b>\n'
-            f'• Полный тест — 20 случайных вопросов\n'
-            f'• Быстрый тест — 10 случайных вопросов\n\n'
-            f'💡 <b>Полезные команды:</b>\n'
-            f'/start — Начать заново\n'
-            f'/stats — Посмотреть статистику\n'
-            f'/reset — Сбросить текущий тест\n\n'
-            f'⚡️ <b>Выбери свой уровень и начинай!</b>'
-        )
-
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-
-        logger.info(f"User {user_id} ({first_name}) started the bot")
-
-    except Exception as e:
-        logger.error(f"Error in start command: {e}", exc_info=True)
-        await update.message.reply_text(
-            "❌ Произошла ошибка при запуске. Попробуйте еще раз: /start"
-        )
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда для показа статистики"""
-    try:
-        user_id = update.message.from_user.id
-        await show_user_stats(update.message, user_id)
-        logger.info(f"User {user_id} requested stats")
-    except Exception as e:
-        logger.error(f"Error in stats command: {e}", exc_info=True)
-        await update.message.reply_text(
-            "❌ Не удалось загрузить статистику. Попробуйте позже."
-        )
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда для сброса текущего теста"""
-    try:
-        user_id = update.message.from_user.id
-
-        # Удаляем сессию
-        delete_session(user_id)
-        if user_id in user_data:
-            del user_data[user_id]
-
-        keyboard = [
-            [InlineKeyboardButton("Junior QA 🌱", callback_data='select_junior')],
-            [InlineKeyboardButton("Middle QA 🚀", callback_data='select_middle')],
-            [InlineKeyboardButton("Senior QA 👑", callback_data='select_senior')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            '🔄 Текущий тест сброшен!\n\nВыбери уровень для нового теста:',
-            reply_markup=reply_markup
-        )
-
-        logger.info(f"User {user_id} reset their test")
-
-    except Exception as e:
-        logger.error(f"Error in reset command: {e}", exc_info=True)
-        await update.message.reply_text(
-            "❌ Не удалось сбросить тест. Попробуйте /start"
-        )
-
-# ==================== CALLBACK HANDLERS ====================
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка нажатий на кнопки"""
-    query = update.callback_query
-
-    try:
-        await query.answer()
-        user_id = query.from_user.id
-
-        # Выбор уровня
-        if query.data.startswith('select_'):
-            level = query.data.replace('select_', '')
-            await select_mode(query, user_id, level)
-
-        # Выбор режима
-        elif query.data.startswith('mode_'):
-            parts = query.data.split('_')
-            level = parts[1]
-            mode = parts[2]
-            await start_test(query, user_id, level, mode)
-
-        # Ответ на вопрос
-        elif query.data.startswith('answer_'):
-            answer_idx = int(query.data.replace('answer_', ''))
-            await check_answer(query, user_id, answer_idx)
-
-        # Следующий вопрос
-        elif query.data == 'next_question':
-            await send_question(query, user_id)
-
-        # Показать статистику
-        elif query.data == 'show_stats':
-            await show_user_stats(query.message, user_id, edit=True, query=query)
-
-        # Вернуться к выбору уровня
-        elif query.data == 'choose_level':
-            await choose_level(query)
-
-        # Повторить тест
-        elif query.data.startswith('retry_'):
-            parts = query.data.split('_')
-            level = parts[1]
-            mode = parts[2]
-            await start_test(query, user_id, level, mode)
-
-    except Exception as e:
-        logger.error(f"Error in button callback: {e}", exc_info=True)
-        try:
-            await query.edit_message_text(
-                "❌ Произошла ошибка. Используйте /reset чтобы начать заново."
-            )
-        except:
-            pass
-
-async def select_mode(query, user_id: int, level: str) -> None:
-    """Выбор режима тестирования"""
-    try:
-        keyboard = [
-            [InlineKeyboardButton("📝 Полный тест (20 вопросов)", callback_data=f'mode_{level}_full')],
-            [InlineKeyboardButton("⚡️ Быстрый тест (10 вопросов)", callback_data=f'mode_{level}_quick')],
-            [InlineKeyboardButton("◀️ Назад", callback_data='choose_level')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        level_emoji = {'junior': '🌱', 'middle': '🚀', 'senior': '👑'}
-        level_names = {'junior': 'Junior QA', 'middle': 'Middle QA', 'senior': 'Senior QA'}
-
-        text = (
-            f"{level_emoji[level]} <b>{level_names[level]}</b>\n\n"
-            f"Выбери режим тестирования:\n\n"
-            f"📝 <b>Полный тест</b> — 20 случайных вопросов\n"
-            f"⚡️ <b>Быстрый тест</b> — 10 случайных вопросов для быстрой проверки"
-        )
-
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-
-    except Exception as e:
-        logger.error(f"Error in select_mode: {e}", exc_info=True)
-        raise
-
-async def start_test(query, user_id: int, level: str, mode: str) -> None:
-    """Начало тестирования"""
-    try:
-        # Удаляем старую сессию
-        delete_session(user_id)
-
-        # Определяем количество вопросов
-        question_count = 10 if mode == 'quick' else 20
-
-        # Выбираем случайные вопросы
-        all_questions = QUESTIONS[level]
-        selected_questions = random.sample(all_questions, min(question_count, len(all_questions)))
-
-        # Создаем новую сессию
-        user_data[user_id] = {
-            'level': level,
-            'mode': mode,
-            'questions': selected_questions,
-            'current_question': 0,
-            'correct_answers': 0,
-            'total_questions': len(selected_questions)
-        }
-
-        # Сохраняем в БД
-        save_session(user_id, user_data[user_id])
-
-        await send_question(query, user_id)
-
-        logger.info(f"User {user_id} started {mode} test on {level} level")
-
-    except Exception as e:
-        logger.error(f"Error in start_test: {e}", exc_info=True)
-        raise
-
-async def send_question(query, user_id: int) -> None:
-    """Отправка вопроса пользователю"""
-    try:
-        # Загружаем данные из памяти или БД
-        if user_id not in user_data:
-            session = load_session(user_id)
-            if not session:
-                await query.edit_message_text(
-                    "❌ Сессия истекла. Начните заново: /start"
-                )
-                return
-            user_data[user_id] = session
-
-        data = user_data[user_id]
-
-        # Проверяем завершение теста
-        if data['current_question'] >= data['total_questions']:
-            await show_results(query, user_id)
-            return
-
-        question_data = data['questions'][data['current_question']]
-        question_num = data['current_question'] + 1
-
-        # Создаем кнопки с вариантами ответов
-        keyboard = []
-        for idx, option in enumerate(question_data['options']):
-            keyboard.append([InlineKeyboardButton(option, callback_data=f'answer_{idx}')])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        level_emoji = {'junior': '🌱', 'middle': '🚀', 'senior': '👑'}
-        mode_emoji = {'full': '📝', 'quick': '⚡️'}
-
-        # Прогресс-бар
-        progress = get_progress_bar(question_num - 1, data['total_questions'])
-
-        question_text = (
-            f"{level_emoji[data['level']]} {mode_emoji[data.get('mode', 'full')]} "
-            f"Вопрос {question_num}/{data['total_questions']}\n\n"
-            f"{progress}\n\n"
-            f"❓ <b>{question_data['question']}</b>"
-        )
-
-        await query.edit_message_text(
-            question_text,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-
-    except Exception as e:
-        logger.error(f"Error in send_question: {e}", exc_info=True)
-        await query.edit_message_text(
-            "❌ Ошибка загрузки вопроса. Используйте /reset"
-        )
-
-async def check_answer(query, user_id: int, answer_idx: int) -> None:
-    """Проверка ответа пользователя"""
-    try:
-        if user_id not in user_data:
-            session = load_session(user_id)
-            if not session:
-                await query.edit_message_text(
-                    "❌ Сессия истекла. Начните заново: /start"
-                )
-                return
-            user_data[user_id] = session
-
-        data = user_data[user_id]
-        question_data = data['questions'][data['current_question']]
-
-        is_correct = answer_idx == question_data['correct']
-
-        if is_correct:
-            data['correct_answers'] += 1
-            message = (
-                "✅ <b>Правильно!</b>\n\n"
-                f"💡 {question_data.get('explanation', '')}"
-            )
-        else:
-            correct_answer = question_data['options'][question_data['correct']]
-            message = (
-                f"❌ <b>Неправильно!</b>\n\n"
-                f"<b>Правильный ответ:</b>\n{correct_answer}\n\n"
-                f"💡 {question_data.get('explanation', '')}"
-            )
-
-        data['current_question'] += 1
-
-        # Сохраняем прогресс
-        save_session(user_id, data)
-
-        # Кнопка для следующего вопроса
-        keyboard = [[InlineKeyboardButton("Следующий вопрос ➡️", callback_data='next_question')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            message,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-
-    except Exception as e:
-        logger.error(f"Error in check_answer: {e}", exc_info=True)
-        await query.edit_message_text(
-            "❌ Ошибка проверки ответа. Используйте /reset"
-        )
-
-async def show_results(query, user_id: int) -> None:
-    """Показ результатов тестирования"""
-    try:
-        data = user_data[user_id]
-        correct = data['correct_answers']
-        total = data['total_questions']
-        percentage = (correct / total) * 100 if total > 0 else 0
-
-        # Сохраняем результат в БД
-        save_test_result(user_id, data['level'], data.get('mode', 'full'), correct, total)
-
-        # Удаляем сессию
-        delete_session(user_id)
-        if user_id in user_data:
-            del user_data[user_id]
-
-        # Определяем оценку
-        if percentage >= 90:
-            grade = "Отлично! 🌟"
-            comment = "Ты отлично подготовлен к собеседованию!"
-        elif percentage >= 70:
-            grade = "Хорошо! 👍"
-            comment = "Неплохой результат, но есть куда расти."
-        elif percentage >= 50:
-            grade = "Удовлетворительно 📚"
-            comment = "Стоит подтянуть знания по некоторым темам."
-        else:
-            grade = "Нужно больше практики 💪"
-            comment = "Рекомендую повторить материал и попробовать еще раз."
-
-        level_names = {
-            'junior': 'Junior QA Engineer 🌱',
-            'middle': 'Middle QA Engineer 🚀',
-            'senior': 'Senior QA Engineer 👑'
-        }
-
-        keyboard = [
-            [InlineKeyboardButton("Пройти тест заново 🔄", callback_data=f"retry_{data['level']}_{data.get('mode', 'full')}")],
-            [InlineKeyboardButton("Выбрать другой уровень 🎯", callback_data='choose_level')],
-            [InlineKeyboardButton("Моя статистика 📊", callback_data='show_stats')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        mode_text = format_test_mode(data.get('mode', 'full'))
-
-        results_text = (
-            f"🎓 <b>Результаты теста</b>\n"
-            f"{'='*30}\n\n"
-            f"Уровень: {level_names[data['level']]}\n"
-            f"Режим: {mode_text}\n"
-            f"Правильных ответов: {correct}/{total}\n"
-            f"Процент: {percentage:.1f}%\n\n"
-            f"<b>{grade}</b>\n"
-            f"{comment}"
-        )
-
-        await query.edit_message_text(
-            results_text,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-
-        logger.info(f"User {user_id} completed test: {correct}/{total} ({percentage:.1f}%)")
-
-    except Exception as e:
-        logger.error(f"Error in show_results: {e}", exc_info=True)
-        await query.edit_message_text(
-            "❌ Ошибка показа результатов. Используйте /start"
-        )
-
-async def show_user_stats(message, user_id: int, edit: bool = False, query=None) -> None:
-    """Показ статистики пользователя"""
-    try:
-        stats = get_user_stats(user_id)
-
-        if not stats or not stats['overall'] or stats['overall']['total_tests'] == 0:
-            text = (
-                "📊 <b>Статистика</b>\n\n"
-                "У вас пока нет завершенных тестов.\n"
-                "Пройдите первый тест чтобы увидеть статистику!"
-            )
-            keyboard = [[InlineKeyboardButton("Начать тест 🚀", callback_data='choose_level')]]
-        else:
-            overall = stats['overall']
-
-            text = (
-                f"📊 <b>Ваша статистика</b>\n"
-                f"{'='*30}\n\n"
-                f"<b>Общая статистика:</b>\n"
-                f"Пройдено тестов: {overall['total_tests']}\n"
-                f"Средний результат: {overall['avg_percentage']:.1f}%\n"
-                f"Лучший результат: {overall['best_percentage']:.1f}%\n"
-                f"Правильных ответов: {overall['total_correct']}/{overall['total_questions']}\n\n"
-            )
-
-            if stats['by_level']:
-                text += "<b>По уровням:</b>\n"
-                level_names = {'junior': 'Junior 🌱', 'middle': 'Middle 🚀', 'senior': 'Senior 👑'}
-                for level_stat in stats['by_level']:
-                    level = level_stat['level']
-                    text += (
-                        f"\n{level_names.get(level, level)}:\n"
-                        f"  • Попыток: {level_stat['attempts']}\n"
-                        f"  • Средний: {level_stat['avg_percentage']:.1f}%\n"
-                        f"  • Лучший: {level_stat['best_percentage']:.1f}%\n"
-                    )
-
-            if stats['recent']:
-                text += f"\n\n<b>Последние тесты:</b>\n"
-                for i, test in enumerate(stats['recent'][:3], 1):
-                    mode_icon = '📝' if test.get('mode') == 'full' else '⚡️'
-                    text += f"{i}. {mode_icon} {test['level']} - {test['percentage']:.0f}%\n"
-
-            keyboard = [[InlineKeyboardButton("Пройти новый тест 🚀", callback_data='choose_level')]]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if edit and query:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        else:
-            await message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
-
-    except Exception as e:
-        logger.error(f"Error in show_user_stats: {e}", exc_info=True)
-        error_text = "❌ Не удалось загрузить статистику."
-        if edit and query:
-            await query.edit_message_text(error_text)
-        else:
-            await message.reply_text(error_text)
-
-async def choose_level(query) -> None:
-    """Возврат к выбору уровня"""
-    try:
-        keyboard = [
-            [InlineKeyboardButton("Junior QA 🌱", callback_data='select_junior')],
-            [InlineKeyboardButton("Middle QA 🚀", callback_data='select_middle')],
-            [InlineKeyboardButton("Senior QA 👑", callback_data='select_senior')],
-            [InlineKeyboardButton("📊 Моя статистика", callback_data='show_stats')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            '🎯 Выбери уровень для прохождения теста:',
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        logger.error(f"Error in choose_level: {e}", exc_info=True)
-        raise
-
-# ==================== MAIN ====================
-
-def main() -> None:
-    """Запуск бота"""
-    try:
-        # Инициализируем БД
-        init_database()
-
-        # Получаем токен из переменной окружения
-        token = os.getenv('BOT_TOKEN')
-
-        if not token:
-            logger.error("❌ Ошибка: Не указан токен бота!")
-            logger.error("Укажите переменную окружения BOT_TOKEN")
-            return
-
-        logger.info("🚀 Инициализация бота...")
-        application = Application.builder().token(token).build()
-
-        # Регистрация обработчиков
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CommandHandler("reset", reset))
-        application.add_handler(CallbackQueryHandler(button_callback))
-
-        # Запуск бота
-        logger.info("🤖 Бот запущен и готов к работе!")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-    except Exception as e:
-        logger.error(f"❌ Critical error in main: {e}", exc_info=True)
-        raise
-
-if __name__ == '__main__':
-    main()
