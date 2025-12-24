@@ -401,7 +401,7 @@ QUESTIONS = {
         {
             'question': 'Жизненный цикл дефекта: правильный порядок?',
             'options': [
-                'New → Assigned → Fixed → Verified → Closed',
+                'New → Assigned → Fixed\n→ Verified → Closed',
                 'Open → Close',
                 'Found → Deleted',
                 'Bug → No Bug'
@@ -832,7 +832,7 @@ QUESTIONS = {
         {
             'question': 'Основные HTTP методы?',
             'options': [
-                'GET, POST, PUT, DELETE, PATCH',
+                'GET, POST, PUT,\nDELETE, PATCH',
                 'SEND, RECEIVE, UPDATE',
                 'READ, WRITE, EXECUTE',
                 'OPEN, CLOSE, SAVE'
@@ -865,7 +865,7 @@ QUESTIONS = {
         {
             'question': 'Что такое CI/CD?',
             'options': [
-                'Continuous Integration/Continuous Delivery',
+                'Continuous Integration/\nContinuous Delivery',
                 'Code Integration',
                 'Computer Integration',
                 'Critical Integration'
@@ -1395,7 +1395,7 @@ QUESTIONS = {
         {
             'question': 'Основные метрики качества кода?',
             'options': [
-                'Code Coverage, Cyclomatic Complexity, Tech Debt',
+                'Code Coverage,\nCyclomatic Complexity, Tech Debt',
                 'Только строки кода',
                 'Только функции',
                 'Только классы'
@@ -1505,7 +1505,7 @@ QUESTIONS = {
         {
             'question': 'Test Pyramid - правильная структура?',
             'options': [
-                'Много unit → средне integration → мало E2E',
+                'Много unit → средне\nintegration → мало E2E',
                 'Много E2E → мало unit',
                 'Все типы поровну',
                 'Только unit тесты'
@@ -1626,7 +1626,7 @@ QUESTIONS = {
         {
             'question': 'Что такое Performance Testing Strategy?',
             'options': [
-                'Load, Stress, Spike, Endurance, Scalability тесты',
+                'Load, Stress, Spike,\nEndurance, Scalability',
                 'Только Load тесты',
                 'Только Unit тесты',
                 'Только UI тесты'
