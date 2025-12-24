@@ -237,27 +237,6 @@ def format_test_mode(mode: str) -> str:
     }
     return modes.get(mode, mode)
 
-def split_long_text(text, max_length=35):
-    """Разбивает текст на строки указанной максимальной длины"""
-    words = text.split()
-    lines = []
-    current_line = []
-    current_length = 0
-
-    for word in words:
-        if current_length + len(word) + 1 <= max_length:
-            current_line.append(word)
-            current_length += len(word) + 1
-        else:
-            if current_line:
-                lines.append(' '.join(current_line))
-            current_line = [word]
-            current_length = len(word)
-
-    if current_line:
-        lines.append(' '.join(current_line))
-
-    return '\n'.join(lines)
 
 # ==================== QUESTIONS ====================
 
@@ -2137,10 +2116,10 @@ async def start_test(query, user_id: int, level: str, mode: str) -> None:
             new_correct = next(i for i, (opt, is_correct) in enumerate(options_with_flags) if is_correct)
             # Создаем новый вопрос с перемешанными вариантами
             shuffled_q = {
-                'question': split_long_text(q['question']),  # Форматируем вопрос
-                'options': [split_long_text(opt) for opt, _ in options_with_flags],  # Форматируем все варианты
+                'question': q['question'],
+                'options': [opt for opt, _ in options_with_flags],
                 'correct': new_correct,
-                'explanation': split_long_text(q['explanation'])  # Форматируем объяснение
+                'explanation': q['explanation']
             }
             shuffled_questions.append(shuffled_q)
 
@@ -2188,10 +2167,22 @@ async def send_question(query, user_id: int) -> None:
         question_data = data['questions'][data['current_question']]
         question_num = data['current_question'] + 1
 
-        # Создаем кнопки с вариантами ответов (уже отформатированными)
-        keyboard = []
-        for idx, option in enumerate(question_data['options']):
-            keyboard.append([InlineKeyboardButton(option, callback_data=f'answer_{idx}')])
+        # Эмодзи для вариантов ответов
+        option_emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣']
+
+        # Формируем текст с вариантами ответов
+        options_text = "\n\n".join([
+            f"{option_emojis[idx]} {option}"
+            for idx, option in enumerate(question_data['options'])
+        ])
+
+        # Создаем кнопки с номерами (короткие)
+        keyboard = [[
+            InlineKeyboardButton("1️⃣", callback_data='answer_0'),
+            InlineKeyboardButton("2️⃣", callback_data='answer_1'),
+            InlineKeyboardButton("3️⃣", callback_data='answer_2'),
+            InlineKeyboardButton("4️⃣", callback_data='answer_3')
+        ]]
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2205,7 +2196,8 @@ async def send_question(query, user_id: int) -> None:
             f"{level_emoji[data['level']]} {mode_emoji[data.get('mode', 'full')]} "
             f"Вопрос {question_num}/{data['total_questions']}\n\n"
             f"{progress}\n\n"
-            f"❓ <b>{question_data['question']}</b>"
+            f"❓ <b>{question_data['question']}</b>\n\n"
+            f"{options_text}"
         )
 
         await query.edit_message_text(
