@@ -221,10 +221,48 @@ def delete_session(user_id: int):
     except Exception as e:
         logger.error(f"Error deleting session for user {user_id}: {e}")
 
+# ==================== HELPER FUNCTIONS ====================
+
+def get_progress_bar(current: int, total: int, length: int = 10) -> str:
+    """Создание прогресс-бара"""
+    filled = int(length * current / total)
+    bar = '█' * filled + '░' * (length - filled)
+    return f"[{bar}] {current}/{total}"
+
+def format_test_mode(mode: str) -> str:
+    """Форматирование названия режима"""
+    modes = {
+        'full': 'Полный тест (20 вопросов)',
+        'quick': 'Быстрый тест (10 вопросов)'
+    }
+    return modes.get(mode, mode)
+
+def split_long_text(text, max_length=35):
+    """Разбивает текст на строки указанной максимальной длины"""
+    words = text.split()
+    lines = []
+    current_line = []
+    current_length = 0
+
+    for word in words:
+        if current_length + len(word) + 1 <= max_length:
+            current_line.append(word)
+            current_length += len(word) + 1
+        else:
+            if current_line:
+                lines.append(' '.join(current_line))
+            current_line = [word]
+            current_length = len(word)
+
+    if current_line:
+        lines.append(' '.join(current_line))
+
+    return '\n'.join(lines)
+
 # ==================== QUESTIONS ====================
 
 # Расширенная база вопросов (50 вопросов на уровень)
-# Исправлено форматирование для корректного отображения в Telegram
+# Все тексты уже отформатированы для корректного отображения
 
 QUESTIONS = {
     'junior': [
@@ -729,7 +767,7 @@ QUESTIONS = {
                 'Случайное тестирование без системного подхода',
                 'Тестирование обезьян',
                 'Автоматическое тестирование',
-                'Стресс-тестирование'
+                'Стресс1тестирование'
             ],
             'correct': 0,
             'explanation': 'Monkey testing - хаотичное нажатие кнопок для поиска крашей и неожиданного поведения.'
@@ -1888,22 +1926,6 @@ QUESTIONS = {
 # Хранилище данных пользователей в памяти (для быстрого доступа)
 user_data = {}
 
-# ==================== HELPER FUNCTIONS ====================
-
-def get_progress_bar(current: int, total: int, length: int = 10) -> str:
-    """Создание прогресс-бара"""
-    filled = int(length * current / total)
-    bar = '█' * filled + '░' * (length - filled)
-    return f"[{bar}] {current}/{total}"
-
-def format_test_mode(mode: str) -> str:
-    """Форматирование названия режима"""
-    modes = {
-        'full': 'Полный тест (20 вопросов)',
-        'quick': 'Быстрый тест (10 вопросов)'
-    }
-    return modes.get(mode, mode)
-
 # ==================== COMMAND HANDLERS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2090,7 +2112,7 @@ async def select_mode(query, user_id: int, level: str) -> None:
         raise
 
 async def start_test(query, user_id: int, level: str, mode: str) -> None:
-    """Начало тестирования"""
+    """Начало тестирования с исправленным перемешиванием ответов"""
     try:
         # Удаляем старую сессию
         delete_session(user_id)
@@ -2102,14 +2124,32 @@ async def start_test(query, user_id: int, level: str, mode: str) -> None:
         all_questions = QUESTIONS[level]
         selected_questions = random.sample(all_questions, min(question_count, len(all_questions)))
 
+        # ИСПРАВЛЕНИЕ: Перемешиваем варианты ответов для каждого вопроса
+        shuffled_questions = []
+        for q in selected_questions:
+            # Создаем список пар (вариант, это_правильный_ответ)
+            options_with_flags = [(opt, i == q['correct']) for i, opt in enumerate(q['options'])]
+            # Перемешиваем этот список
+            random.shuffle(options_with_flags)
+            # Находим новый индекс правильного ответа
+            new_correct = next(i for i, (opt, is_correct) in enumerate(options_with_flags) if is_correct)
+            # Создаем новый вопрос с перемешанными вариантами
+            shuffled_q = {
+                'question': split_long_text(q['question']),  # Форматируем вопрос
+                'options': [split_long_text(opt) for opt, _ in options_with_flags],  # Форматируем все варианты
+                'correct': new_correct,
+                'explanation': split_long_text(q['explanation'])  # Форматируем объяснение
+            }
+            shuffled_questions.append(shuffled_q)
+
         # Создаем новую сессию
         user_data[user_id] = {
             'level': level,
             'mode': mode,
-            'questions': selected_questions,
+            'questions': shuffled_questions,
             'current_question': 0,
             'correct_answers': 0,
-            'total_questions': len(selected_questions)
+            'total_questions': len(shuffled_questions)
         }
 
         # Сохраняем в БД
@@ -2124,7 +2164,7 @@ async def start_test(query, user_id: int, level: str, mode: str) -> None:
         raise
 
 async def send_question(query, user_id: int) -> None:
-    """Отправка вопроса пользователю"""
+    """Отправка вопроса пользователю с форматированными вариантами ответов"""
     try:
         # Загружаем данные из памяти или БД
         if user_id not in user_data:
@@ -2146,7 +2186,7 @@ async def send_question(query, user_id: int) -> None:
         question_data = data['questions'][data['current_question']]
         question_num = data['current_question'] + 1
 
-        # Создаем кнопки с вариантами ответов
+        # Создаем кнопки с вариантами ответов (уже отформатированными)
         keyboard = []
         for idx, option in enumerate(question_data['options']):
             keyboard.append([InlineKeyboardButton(option, callback_data=f'answer_{idx}')])
@@ -2179,7 +2219,7 @@ async def send_question(query, user_id: int) -> None:
         )
 
 async def check_answer(query, user_id: int, answer_idx: int) -> None:
-    """Проверка ответа пользователя"""
+    """Проверка ответа пользователя с форматированными текстами"""
     try:
         if user_id not in user_data:
             session = load_session(user_id)
@@ -2378,6 +2418,7 @@ async def choose_level(query) -> None:
     except Exception as e:
         logger.error(f"Error in choose_level: {e}", exc_info=True)
         raise
+
 
 # ==================== MAIN ====================
 
